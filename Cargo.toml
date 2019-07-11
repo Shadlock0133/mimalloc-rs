@@ -1,0 +1,27 @@
+[package]
+name = "mimalloc-rs"
+version = "0.1.0"
+authors = ["Aurora <tomek-kubel2@wp.pl>"]
+edition = "2018"
+
+[dependencies]
+errno = "0.2.4"
+log = "0.4.7"
+libc = "0.2.59"
+
+[dependencies.winapi]
+version = "0.3.7"
+features = [
+    "impl-default",
+    "errhandlingapi",
+    "handleapi",
+    "libloaderapi",
+    "memoryapi",
+    "minwindef",
+    "processthreadsapi",
+    "securitybaseapi",
+    "sysinfoapi",
+    "winerror",
+    "winbase",
+    "winnt",
+]
