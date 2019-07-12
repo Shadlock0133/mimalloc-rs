@@ -48,7 +48,7 @@ pub const MI_BIN_FULL: usize = MI_BIN_HUGE + 1;
 pub const MI_MAX_ALIGN_SIZE: usize = 16;   // sizeof(max_align_t)
 
 pub struct Block {
-    next: usize,
+    pub next: usize,
 }
 
 pub enum Delayed {
@@ -56,6 +56,8 @@ pub enum Delayed {
     USE_DELAYED_FREE = 1,
     DELAYED_FREEING = 2,
 }
+
+pub use Delayed::*;
 
 pub union PageFlags {
     value: u16,
@@ -74,75 +76,78 @@ pub struct ThreadFree { value: AtomicUsize, }
 
 pub struct Page {
     // "owned" by the segment
-    segment_idx: u8,                           // index in the segment `pages` array, `page == &segment->pages[page->segment_idx]`
-    segment_in_use: bool,                      // `true` if the segment allocated this page
-    is_reset: bool,                            // `true` if the page memory was reset
+    pub segment_idx: u8,                           // index in the segment `pages` array, `page == &segment->pages[page->segment_idx]`
+    pub segment_in_use: bool,                      // `true` if the segment allocated this page
+    pub is_reset: bool,                            // `true` if the page memory was reset
 
     // layout like this to optimize access in `mi_malloc` and `mi_free`
-    flags: PageFlags,
-    capacity: u16,                             // number of blocks committed
-    reserved: u16,                             // numbes of blocks reserved in memory
+    pub flags: PageFlags,
+    pub capacity: u16,                             // number of blocks committed
+    pub reserved: u16,                             // numbes of blocks reserved in memory
 
-    free: *mut Block,                          // list of available free blocks (`malloc` allocates from this list)
-    cookie: usize,                             // random cookie to encode the free lists
-    used: usize,                               // number of blocks in use (including blocks in `local_free` and `thread_free`)
+    pub free: *mut Block,                          // list of available free blocks (`malloc` allocates from this list)
+    pub cookie: usize,                             // random cookie to encode the free lists
+    pub used: usize,                               // number of blocks in use (including blocks in `local_free` and `thread_free`)
 
-    local_free: *mut Block,                    // list of deferred free blocks by this thread (migrates to `free`)
-    thread_freed: AtomicUsize,                 // at least this number of blocks are in `thread_free`
-    thread_free: ThreadFree,                   // list of deferred free blocks freed by other threads
+    pub local_free: *mut Block,                    // list of deferred free blocks by this thread (migrates to `free`)
+    pub thread_freed: AtomicUsize,                 // at least this number of blocks are in `thread_free`
+    pub thread_free: ThreadFree,                   // list of deferred free blocks freed by other threads
 
     // less accessed info
-    block_size: usize,                         // size available in each block (always `>0`)
-    heap: *mut Heap,                           // the owning heap
-    next: *mut Page,                           // next page owned by this thread with the same `block_size`
-    prev: *mut Page,                           // previous page owned by this thread with the same `block_size`
+    pub block_size: usize,                         // size available in each block (always `>0`)
+    pub heap: *mut Heap,                           // the owning heap
+    pub next: *mut Page,                           // next page owned by this thread with the same `block_size`
+    pub prev: *mut Page,                           // previous page owned by this thread with the same `block_size`
 }
 
+#[derive(PartialEq)]
 pub enum PageKind {
     PAGE_SMALL,    // small blocks go into 64kb pages inside a segment
     PAGE_LARGE,    // larger blocks go into a single page spanning a whole segment
     PAGE_HUGE,     // huge blocks (>512kb) are put into a single page in a segment of the exact size (but still 2mb aligned)
 }
 
+pub use PageKind::*;
+
 // Segments are large allocated memory blocks (2mb on 64 bit) from
 // the OS. Inside segments we allocated fixed size _pages_ that
 // contain blocks.
 pub struct Segment {
-    next: *mut Segment,
-    prev: *mut Segment,
-    abandoned_next: *mut Segment,
-    abandoned: usize,   // abandoned pages (i.e. the original owning thread stopped) (`abandoned <= used`)
-    used: usize,        // count of pages in use (`used <= capacity`)
-    capacity: usize,    // count of available pages (`#free + used`)
-    segment_size: usize,// for huge pages this may be different from `MI_SEGMENT_SIZE`
-    segment_info_size: usize,  // space we are using from the first page for segment meta-data and possible guard pages.
-    cookie: usize,      // verify addresses in debug mode: `mi_ptr_cookie(segment) == segment->cookie`
+    pub next: *mut Segment,
+    pub prev: *mut Segment,
+    pub abandoned_next: *mut Segment,
+    pub abandoned: usize,   // abandoned pages (i.e. the original owning thread stopped) (`abandoned <= used`)
+    pub used: usize,        // count of pages in use (`used <= capacity`)
+    pub capacity: usize,    // count of available pages (`#free + used`)
+    pub segment_size: usize,// for huge pages this may be different from `MI_SEGMENT_SIZE`
+    pub segment_info_size: usize,  // space we are using from the first page for segment meta-data and possible guard pages.
+    pub cookie: usize,      // verify addresses in debug mode: `mi_ptr_cookie(segment) == segment->cookie`
 
     // layout like this to optimize access in `mi_free`
-    page_shift: usize,  // `1 << page_shift` == the page sizes == `page->block_size * page->reserved` (unless the first page, then `-segment_info_size`).
-    thread_id: usize,   // unique id of the thread owning this segment
-    page_kind: PageKind,   // kind of pages: small, large, or huge
-    pages: *mut Page,    // up to `MI_SMALL_PAGES_PER_SEGMENT` pages
+    pub page_shift: usize,  // `1 << page_shift` == the page sizes == `page->block_size * page->reserved` (unless the first page, then `-segment_info_size`).
+    pub thread_id: usize,   // unique id of the thread owning this segment
+    pub page_kind: PageKind,   // kind of pages: small, large, or huge
+    pub pages: *mut Page,    // up to `MI_SMALL_PAGES_PER_SEGMENT` pages
 }
 
 // Pages of a certain block size are held in a queue.
 pub struct PageQueue {
-    first: *mut Page,
-    last: *mut Page,
-    block_size: usize,
+    pub first: *mut Page,
+    pub last: *mut Page,
+    pub block_size: usize,
 }
 
 // A heap owns a set of pages.
 pub struct Heap {
-    tld:                  *mut Tld,
-    pages_free_direct:    [*mut Page; MI_SMALL_WSIZE_MAX + 2],   // optimize: array where every entry points a page with possibly free blocks in the corresponding queue for that size.
-    pages:                [PageQueue; MI_BIN_FULL + 1],          // queue of pages for each size class (or "bin")
-    thread_delayed_free:  AtomicPtr<Block>,
-    thread_id:            usize,                                 // thread this heap belongs too
-    cookie:               usize,
-    random:               usize,                                 // random number used for secure allocation
-    page_count:           usize,                                 // total number of pages in the `pages` queues.
-    no_reclaim:           bool,                                  // `true` if this heap should not reclaim abandoned pages
+    pub tld:                  *mut Tld,
+    pub pages_free_direct:    [*mut Page; MI_SMALL_WSIZE_MAX + 2],   // optimize: array where every entry points a page with possibly free blocks in the corresponding queue for that size.
+    pub pages:                [PageQueue; MI_BIN_FULL + 1],          // queue of pages for each size class (or "bin")
+    pub thread_delayed_free:  AtomicPtr<Block>,
+    pub thread_id:            usize,                                 // thread this heap belongs too
+    pub cookie:               usize,
+    pub random:               usize,                                 // random number used for secure allocation
+    pub page_count:           usize,                                 // total number of pages in the `pages` queues.
+    pub no_reclaim:           bool,                                  // `true` if this heap should not reclaim abandoned pages
 }
 
 // ------------------------------------------------------
@@ -189,35 +194,35 @@ pub struct Stats {
 
 // Queue of segments
 pub struct SegmentQueue {
-    first: *mut Segment,
-    last:  *mut Segment,
+    pub first: *mut Segment,
+    pub last:  *mut Segment,
 }
 
 // Segments thread local data
 pub struct SegmentsTld {
-    small_free:    SegmentQueue,  // queue of segments with free small pages
-    current_size:  usize,         // current size of all segments
-    peak_size:     usize,         // peak size of all segments
-    cache_count:   usize,         // number of segments in the cache
-    cache_size:    usize,         // total size of all segments in the cache
-    cache:         SegmentQueue,  // (small) cache of segments for small and large pages (to avoid repeated mmap calls)
-    stats:         *mut Stats,    // points to tld stats
+    pub small_free:    SegmentQueue,  // queue of segments with free small pages
+    pub current_size:  usize,         // current size of all segments
+    pub peak_size:     usize,         // peak size of all segments
+    pub cache_count:   usize,         // number of segments in the cache
+    pub cache_size:    usize,         // total size of all segments in the cache
+    pub cache:         SegmentQueue,  // (small) cache of segments for small and large pages (to avoid repeated mmap calls)
+    pub stats:         *mut Stats,    // points to tld stats
 }
 
 // OS thread local data
 pub struct OsTld {
-    mmap_next_probable:  usize,       // probable next address start allocated by mmap (to guess which path to take on alignment)
-    mmap_previous:       *mut (),     // previous address returned by mmap
-    pool:                *mut u8,     // pool of segments to reduce mmap calls on some platforms
-    pool_available:      usize,       // bytes available in the pool
+    pub mmap_next_probable:  usize,       // probable next address start allocated by mmap (to guess which path to take on alignment)
+    pub mmap_previous:       *mut (),     // previous address returned by mmap
+    pub pool:                *mut u8,     // pool of segments to reduce mmap calls on some platforms
+    pub pool_available:      usize,       // bytes available in the pool
     pub stats:           *mut Stats,  // points to tld stats
 }
 
 // Thread local data
 pub struct Tld {
-    heartbeat:     u64,          // monotonic heartbeat count
-    heap_backing:  *mut Heap,    // backing heap of this thread (cannot be deleted)
-    segments:      SegmentsTld,  // segment tld
-    os:            OsTld,        // os tld
-    stats:         Stats,        // statistics
+    pub heartbeat:     u64,          // monotonic heartbeat count
+    pub heap_backing:  *mut Heap,    // backing heap of this thread (cannot be deleted)
+    pub segments:      SegmentsTld,  // segment tld
+    pub os:            OsTld,        // os tld
+    pub stats:         Stats,        // statistics
 }

@@ -18,7 +18,7 @@ use winapi::{
         sysinfoapi::*,
         winbase::LookupPrivilegeValueA,
         winnt::{
-            MEM_EXTENDED_PARAMETER, MEM_EXTENDED_PARAMETER_TYPE, MEM_ADDRESS_REQUIREMENTS,
+            // MEM_EXTENDED_PARAMETER, MEM_EXTENDED_PARAMETER_TYPE, MEM_ADDRESS_REQUIREMENTS,
             MEM_RELEASE, MEM_RESERVE, MEM_COMMIT, MEM_DECOMMIT, MEM_LARGE_PAGES,
             MEM_RESET,
             PAGE_READWRITE, PAGE_NOACCESS,
@@ -29,7 +29,7 @@ use winapi::{
 };
 
 use log::warn;
-use core::{ptr::null_mut};
+use core::{mem::transmute, ptr::null_mut};
 use crate::{
     stats::*,
     types::*,
@@ -40,7 +40,7 @@ use crate::{
 static mut _os_page_size: usize = 4096;
 
 // minimal allocation granularity
-static os_alloc_granularity: usize = 4096;
+static mut os_alloc_granularity: usize = 4096;
 
 // if non-zero, use large page allocation
 static mut large_os_page_size: usize = 0;
@@ -78,49 +78,49 @@ unsafe fn os_large_page_size() -> usize {
     if large_os_page_size != 0 { large_os_page_size } else { os_page_size() }
 }
 
-fn use_large_os_page(size: usize, align: usize) -> bool {
+unsafe fn use_large_os_page(size: usize, align: usize) -> bool {
   // if we have access, check the size and alignment requirements
   if large_os_page_size == 0 { return false; }
   (size % large_os_page_size) == 0 && (align % large_os_page_size) == 0
 }
 
 // round to a good allocation size
-fn os_good_alloc_size(size: usize, _align: usize) -> usize {
+unsafe fn os_good_alloc_size(size: usize, _align: usize) -> usize {
     if size >= (usize::max_value() - os_alloc_granularity) { return size; } // possible overflow?
     align_up(size, os_alloc_granularity)
 }
 
 #[cfg(windows)]
-type VirtualAlloc2Ptr = extern "stdcall" fn(HANDLE, LPVOID, ULONGLONG, ULONG, ULONG, *mut MEM_EXTENDED_PARAMETER, ULONG) -> LPVOID;
+// type VirtualAlloc2Ptr = extern "stdcall" fn(HANDLE, LPVOID, ULONGLONG, ULONG, ULONG, *mut MEM_EXTENDED_PARAMETER, ULONG) -> LPVOID;
+type VirtualAlloc2Ptr = extern "stdcall" fn(HANDLE, LPVOID, ULONGLONG, ULONG, ULONG, LPVOID, ULONG) -> LPVOID;
 #[cfg(windows)]
-static mut pVirtualAlloc2: VirtualAlloc2Ptr = null_mut();
+static mut pVirtualAlloc2: Option<VirtualAlloc2Ptr> = None;
 
 #[cfg(windows)]
-fn os_init() {
+unsafe fn os_init() {
     // get the page size
-    let si: SYSTEM_INFO = Default::default();
+    let mut si: SYSTEM_INFO = Default::default();
     GetSystemInfo(&mut si);
     if si.dwPageSize > 0 {_os_page_size = si.dwPageSize as _;}
     if si.dwAllocationGranularity > 0 {os_alloc_granularity = si.dwAllocationGranularity as _;}
     // get the VirtualAlloc2 function
-    let hDll: HINSTANCE;
-    hDll = LoadLibraryA(b"kernelbase.dll\0" as *const u8 as _);
-    if !hDll.is_null() {
+    let h_dll: HINSTANCE = LoadLibraryA(b"kernelbase.dll\0" as *const u8 as _);
+    if !h_dll.is_null() {
         // use VirtualAlloc2FromApp as it is available to Windows store apps
-        pVirtualAlloc2 = GetProcAddress(hDll, b"VirtualAlloc2FromApp\0" as *const u8 as _) as VirtualAlloc2Ptr;
-        FreeLibrary(hDll);
+        pVirtualAlloc2 = Some(transmute(GetProcAddress(h_dll, b"VirtualAlloc2FromApp\0" as *const u8 as _)));
+        FreeLibrary(h_dll);
     }
     // Try to see if large OS pages are supported
-    let err: u32 = 0;
-    let ok: bool = option_is_enabled(option_large_os_pages);
+    let mut err: u32 = 0;
+    let mut ok: bool = option_is_enabled(option_large_os_pages);
     if ok {
         // To use large pages on Windows, we first need access permission
         // Set "Lock pages in memory" permission in the group policy editor
         // <https://devblogs.microsoft.com/oldnewthing/20110128-00/?p=11643>
-        let token: HANDLE = null_mut();
+        let mut token: HANDLE = null_mut();
         ok = OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &mut token) != 0;
         if ok {
-            let tp: TOKEN_PRIVILEGES;
+            let mut tp: TOKEN_PRIVILEGES = Default::default();
             ok = LookupPrivilegeValueA(null_mut(), b"SeLockMemoryPrivilege\0" as *const _ as _, &mut tp.Privileges[0].Luid) != 0;
             if ok {
                 tp.PrivilegeCount = 1;
@@ -144,7 +144,7 @@ fn os_init() {
 }
 
 #[cfg(not(windows))]
-fn os_init() {
+unsafe fn os_init() {
     // get the page size
     let result: i32 = sysconf(_SC_PAGESIZE);
     if (result > 0) {
@@ -158,7 +158,7 @@ fn os_init() {
 
 unsafe fn os_mem_free(addr: *mut u8, size: usize, stats: *mut Stats) -> bool {
     if addr.is_null() || size == 0 { return true; }
-    let err: bool = false;
+    let err: bool;
     #[cfg(windows)]
     {
         err = VirtualFree(addr as _, 0, MEM_RELEASE) == 0;
@@ -178,22 +178,28 @@ unsafe fn os_mem_free(addr: *mut u8, size: usize, stats: *mut Stats) -> bool {
 }
 
 #[cfg(windows)]
-fn win_virtual_allocx(addr: *mut u8, size: usize, try_align: usize, flags: DWORD) -> *mut u8 {
-    if try_align > 0 && (try_align % os_page_size()) == 0 && !pVirtualAlloc2.is_null() {
-        // on modern Windows try use VirtualAlloc2
-        let reqs: MEM_ADDRESS_REQUIREMENTS = Default::default();
-        reqs.Alignment = try_align;
-        let param: MEM_EXTENDED_PARAMETER = Default::default();
-        param.Type = MEM_EXTENDED_PARAMETER_TYPE::MemExtendedParameterAddressRequirements;
-        param.Pointer = &reqs;
-        (pVirtualAlloc2)(addr as _, NULL, size as _, flags, PAGE_READWRITE, &param, 1) as _
-    } else {
+unsafe fn win_virtual_allocx(addr: *mut u8, size: usize, _try_align: usize, flags: DWORD) -> *mut u8 {
+    // TODO: Uncomment this and winapi import after MEM_* types get added
+    // if try_align > 0 && (try_align % os_page_size()) == 0 && !pVirtualAlloc2.is_null() {
+    //     // on modern Windows try use VirtualAlloc2
+    //     let reqs: MEM_ADDRESS_REQUIREMENTS = Default::default();
+    //     reqs.Alignment = try_align;
+    //     let param: MEM_EXTENDED_PARAMETER = Default::default();
+    //     param.Type = MEM_EXTENDED_PARAMETER_TYPE::MemExtendedParameterAddressRequirements;
+    //     param.Pointer = &reqs;
+    //     if let Some(pVirtualAlloc2) = pVirtualAlloc2 {
+    //         (pVirtualAlloc2)(addr as _, NULL, size as _, flags, PAGE_READWRITE, &param, 1) as _
+    //     } else {
+    //         null_mut()
+    //     }
+    // } else {
         VirtualAlloc(addr as _, size, flags, PAGE_READWRITE) as _
-    }
+    // }
 }
 
-fn win_virtual_alloc(addr: *mut u8, size: usize, try_align: usize, flags: DWORD) -> *mut u8 {
-    let p = null_mut();
+#[cfg(windows)]
+unsafe fn win_virtual_alloc(addr: *mut u8, size: usize, try_align: usize, flags: DWORD) -> *mut u8 {
+    let mut p = null_mut();
     if use_large_os_page(size, try_align) {
         p = win_virtual_allocx(addr, size, try_align, MEM_LARGE_PAGES | flags);
         // fall back to non-large page allocation on error (`p == NULL`).
@@ -205,8 +211,8 @@ fn win_virtual_alloc(addr: *mut u8, size: usize, try_align: usize, flags: DWORD)
 }
 
 #[cfg(not(windows))]
-fn unix_mmap(size: usize, try_align: usize, protect_flags: u32) -> *mut u8 {
-    let p = null_mut();
+unsafe fn unix_mmap(size: usize, try_align: usize, protect_flags: u32) -> *mut u8 {
+    let mut p = null_mut();
     let flags = MAP_PRIVATE | MAP_ANONYMOUS;
     // TODO
     // #if defined(MAP_ALIGNED)  // BSD
@@ -249,14 +255,14 @@ fn unix_mmap(size: usize, try_align: usize, protect_flags: u32) -> *mut u8 {
 
 // Primitive allocation from the OS.
 // Note: the `alignment` is just a hint and the returned pointer is not guaranteed to be aligned.
-fn os_mem_alloc(size: usize, try_align: usize, commit: bool, stats: *mut Stats) -> *mut u8 {
+unsafe fn os_mem_alloc(size: usize, try_align: usize, commit: bool, stats: *mut Stats) -> *mut u8 {
     debug_assert!(size > 0 && (size % os_page_size()) == 0);
     if size == 0 { return null_mut(); }
 
-    let p: *mut u8 = null_mut();
+    let mut p: *mut u8 = null_mut();
     #[cfg(windows)]
     {
-        let flags = MEM_RESERVE;
+        let mut flags = MEM_RESERVE;
         if commit { flags |= MEM_COMMIT; }
         p = win_virtual_alloc(null_mut(), size, try_align, flags);
     } 
@@ -275,14 +281,14 @@ fn os_mem_alloc(size: usize, try_align: usize, commit: bool, stats: *mut Stats) 
 
 // Primitive aligned allocation from the OS.
 // This function guarantees the allocated memory is aligned.
-fn os_mem_alloc_aligned(size: usize, align: usize, commit: bool, stats: *mut Stats) -> *mut u8 {
+unsafe fn os_mem_alloc_aligned(mut size: usize, align: usize, commit: bool, stats: *mut Stats) -> *mut u8 {
     debug_assert!(align >= os_page_size() && ((align & (align - 1)) == 0));
     debug_assert!(size > 0 && (size % os_page_size()) == 0);
     if !(align >= os_page_size() && ((align & (align - 1)) == 0)) { return null_mut(); }
     size = align_up(size, os_page_size());
     
     // try first with a hint (this will be aligned directly on Win 10+ or BSD)
-    let p = os_mem_alloc(size, align, commit, stats);
+    let mut p = os_mem_alloc(size, align, commit, stats);
     if p.is_null() { return null_mut(); }
 
     // if not aligned, free it, overallocate, and unmap around it
@@ -298,7 +304,7 @@ fn os_mem_alloc_aligned(size: usize, align: usize, commit: bool, stats: *mut Sta
             // retry this at most 3 times before giving up. 
             // (we can not decommit around the overallocation on Windows, because we can only
             //  free the original pointer, not one pointing inside the area)
-            let flags = MEM_RESERVE;
+            let mut flags = MEM_RESERVE;
             if commit { flags |= MEM_COMMIT; }
             for _ in 0..3 {
                 // over-allocate to determine a virtual memory range
@@ -349,13 +355,13 @@ pub unsafe fn _os_alloc(mut size: usize, stats: *mut Stats) -> *mut u8 {
   return os_mem_alloc(size, 0, true, stats);
 }
 
-pub unsafe fn _os_free(p: *mut u8, size: usize, stats: *mut Stats) {
+pub unsafe fn _os_free(p: *mut u8, mut size: usize, stats: *mut Stats) {
   if size == 0 || p.is_null() { return; }
   size = os_good_alloc_size(size, 0);
   os_mem_free(p, size, stats);
 }
 
-pub unsafe fn _os_alloc_aligned(size: usize, align: usize, commit: bool, tld: *mut OsTld) -> *mut u8 {
+pub unsafe fn _os_alloc_aligned(mut size: usize, mut align: usize, commit: bool, tld: *mut OsTld) -> *mut u8 {
   if size == 0 { return null_mut(); }
   size = os_good_alloc_size(size, align);
   align = align_up(align, os_page_size());
@@ -369,7 +375,7 @@ pub unsafe fn _os_alloc_aligned(size: usize, align: usize, commit: bool, tld: *m
 
 // OS page align within a given area, either conservative (pages inside the area only),
 // or not (straddling pages outside the area is possible)
-fn os_page_align_areax(conservative: bool, addr: *mut u8, size: usize, newsize: *mut usize) -> *mut u8 {
+unsafe fn os_page_align_areax(conservative: bool, addr: *mut u8, size: usize, newsize: *mut usize) -> *mut u8 {
     assert!(!addr.is_null() && size > 0);
     if !newsize.is_null() { *newsize = 0; }
     if size == 0 || addr.is_null() { return null_mut(); }
@@ -393,7 +399,7 @@ fn os_page_align_areax(conservative: bool, addr: *mut u8, size: usize, newsize: 
     start as _
 }
 
-fn os_page_align_area_conservative(addr: *mut u8, size: usize, newsize: *mut usize) -> *mut u8 {
+unsafe fn os_page_align_area_conservative(addr: *mut u8, size: usize, newsize: *mut usize) -> *mut u8 {
     os_page_align_areax(true, addr, size, newsize)
 }
 
@@ -401,9 +407,9 @@ fn os_page_align_area_conservative(addr: *mut u8, size: usize, newsize: *mut usi
 // but may be used later again. This will release physical memory
 // pages and reduce swapping while keeping the memory committed.
 // We page align to a conservative area inside the range to reset.
-fn os_reset(addr: *mut u8, size: usize, stats: *mut Stats) -> bool {
+unsafe fn os_reset(addr: *mut u8, size: usize, stats: *mut Stats) -> bool {
     // page align conservatively within the range
-    let csize: usize = 0;
+    let mut csize: usize = 0;
     let start: *mut u8 = os_page_align_area_conservative(addr, size, &mut csize);
     if csize == 0 { return true; }
     _stat_increase(&mut (*stats).reset, csize as _);
@@ -449,16 +455,16 @@ fn os_reset(addr: *mut u8, size: usize, stats: *mut Stats) -> bool {
 }
 
 // Protect a region in memory to be not accessible.
-fn os_protectx(addr: *mut u8, size: usize, protect: bool) -> bool {
+unsafe fn os_protectx(addr: *mut u8, size: usize, protect: bool) -> bool {
     // page align conservatively within the range
-    let csize: usize = 0;
+    let mut csize: usize = 0;
     let start: *mut u8 = os_page_align_area_conservative(addr, size, &mut csize);
     if csize == 0 { return false; }
 
-    let err = 0;
+    let err;
     #[cfg(windows)]
     {
-        let oldprotect = 0;
+        let mut oldprotect = 0;
         let ok = VirtualProtect(start as _, csize, if protect { PAGE_NOACCESS } else { PAGE_READWRITE }, &mut oldprotect) != 0;
         err = if ok { 0 } else { GetLastError() };
     }
@@ -472,21 +478,21 @@ fn os_protectx(addr: *mut u8, size: usize, protect: bool) -> bool {
     err == 0
 }
 
-fn os_protect(addr: *mut u8, size: usize) -> bool {
+unsafe fn os_protect(addr: *mut u8, size: usize) -> bool {
     os_protectx(addr, size, true)
 }
 
-fn os_unprotect(addr: *mut u8, size: usize) -> bool {
+unsafe fn os_unprotect(addr: *mut u8, size: usize) -> bool {
     os_protectx(addr, size, false)
 }
 
 // Commit/Decommit memory. Commit is aligned liberal, while decommit is aligned conservative.
-fn os_commitx(addr: *mut u8, size: usize, commit: bool, stats: *mut Stats) -> bool {
+unsafe fn os_commitx(addr: *mut u8, size: usize, commit: bool, stats: *mut Stats) -> bool {
     // page align in the range, commit liberally, decommit conservative
-    let csize: usize = 0;
+    let mut csize: usize = 0;
     let start: *mut u8 = os_page_align_areax(!commit, addr, size, &mut csize);
     if csize == 0 { return true; }
-    let err = 0;
+    let err;
     if commit {
         _stat_increase(&mut (*stats).committed, csize as _);
         _stat_increase(&mut (*stats).commit_calls, 1);
@@ -515,15 +521,15 @@ fn os_commitx(addr: *mut u8, size: usize, commit: bool, stats: *mut Stats) -> bo
     err == 0
 }
 
-fn os_commit(addr: *mut u8, size: usize, stats: *mut Stats) -> bool {
+unsafe fn os_commit(addr: *mut u8, size: usize, stats: *mut Stats) -> bool {
     os_commitx(addr, size, true, stats)
 }
 
-fn os_decommit(addr: *mut u8, size: usize, stats: *mut Stats) -> bool {
+unsafe fn os_decommit(addr: *mut u8, size: usize, stats: *mut Stats) -> bool {
     os_commitx(addr, size, false, stats)
 }
 
-fn _mi_os_shrink(p: *mut u8, oldsize: usize, newsize: usize, stats: *mut Stats) -> bool {
+unsafe fn _mi_os_shrink(p: *mut u8, oldsize: usize, newsize: usize, stats: *mut Stats) -> bool {
     // page align conservatively within the range
     debug_assert!(oldsize > newsize && !p.is_null());
     if oldsize < newsize || p.is_null() { return false; }
@@ -531,7 +537,7 @@ fn _mi_os_shrink(p: *mut u8, oldsize: usize, newsize: usize, stats: *mut Stats) 
 
     // oldsize and newsize should be page aligned or we cannot shrink precisely
     let addr: *mut u8 = (p as usize + newsize) as _;
-    let size: usize = 0;
+    let mut size: usize = 0;
     let start: *mut u8 = os_page_align_area_conservative(addr, oldsize - newsize, &mut size);
     if size == 0 || start != addr { return false; }
 

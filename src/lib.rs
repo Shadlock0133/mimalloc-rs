@@ -5,6 +5,9 @@ mod os;
 mod stats;
 mod types;
 mod options;
+mod segment;
+mod internal;
+mod init;
 
 pub struct Mimalloc;
 

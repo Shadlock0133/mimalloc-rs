@@ -1,15 +1,15 @@
 use crate::types::*;
 use core::sync::atomic::Ordering;
 
-pub fn _stat_increase(stat: *mut StatCount, amount: i64) {
+pub unsafe fn _stat_increase(stat: *mut StatCount, amount: i64) {
     _stat_update(stat, amount);
 }
 
-pub fn _stat_decrease(stat: *mut StatCount, amount: i64) {
+pub unsafe fn _stat_decrease(stat: *mut StatCount, amount: i64) {
     _stat_update(stat, -amount);
 }
 
-pub fn _stat_update(stat: *mut StatCount, amount: i64) {
+pub unsafe fn _stat_update(stat: *mut StatCount, amount: i64) {
     if amount == 0 { return; }
     let current = (*stat).current.fetch_add(amount, Ordering::Relaxed);
     
